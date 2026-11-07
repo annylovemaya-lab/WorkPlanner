@@ -1,0 +1,34 @@
+name: Уведомления планера
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: planner-notify
+  cancel-in-progress: false
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Отправить уведомления
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
+        run: node .github/notify.mjs
+      - name: Поддерживать расписание активным
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt 1728000 ]; then
+            date -u +%FT%TZ > .github/keepalive.txt
+            git config user.name planner-bot
+            git config user.email planner-bot@users.noreply.github.com
+            git add .github/keepalive.txt
+            git commit -m "keepalive" && git push
+          fi
