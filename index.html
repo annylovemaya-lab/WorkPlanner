@@ -915,7 +915,8 @@ function genTasks(src){
 function isWeekend(d){return S.cal.weekend.indexOf(wdOf(d))>=0;}
 function nextWorkday(ds){var d=parse(ds),g=0;while(isWeekend(d)&&g++<14)d=addDays(d,1);return fmt(d);}
 function isMoved(it,ds){return it.type==='task'&&it.rec&&it.rec.type==='none'&&!!it.origDate&&it.origDate!==ds;}
-function rollover(){
+function rolloverNow(){
+  items.forEach(function(it){if(it.type==='task'&&it.origDate&&it.origDate!==it.date){it.missedDates=it.missedDates||[];if(it.missedDates.indexOf(it.origDate)<0)it.missedDates.push(it.origDate);}});
   if(!S.tasks.rollover)return false;
   var ts=todayStr(), target=nextWorkday(ts), changed=false;
   items.forEach(function(it){
@@ -932,7 +933,24 @@ function rollover(){
   if(changed)persist();
   return changed;
 }
-items.forEach(function(it){if(it.type==='task'&&it.origDate&&it.origDate!==it.date){it.missedDates=it.missedDates||[];if(it.missedDates.indexOf(it.origDate)<0)it.missedDates.push(it.origDate);}});
+/* Перенос дел не должен перебивать отметки с другого устройства: сначала синхронизируемся, потом переносим */
+function syncStale(){
+  try{
+    var o=(typeof sync==='object'&&sync)?sync:JSON.parse((store&&store.getItem('planner.sync.v1'))||'null');
+    if(!o||!o.on||!o.url||!o.key)return false;
+    return Date.now()-(o.last||0)>90000;
+  }catch(e){return false;}
+}
+var rollWait=false;
+function rollover(){
+  if(syncStale()){
+    if(!rollWait){rollWait=true;setTimeout(function(){
+      var fin=function(){rollWait=false;if(rolloverNow())renderAll();};
+      Promise.resolve(doSync(true)).then(fin,fin);},400);}
+    return false;
+  }
+  return rolloverNow();
+}
 rollover();
 
 var now=new Date();
@@ -1937,7 +1955,7 @@ function doData(k){
     items=pendingImport.items;dayOrder=pendingImport.order;persist();persistOrder();
     if(pendingImport.tpls){tpls=pendingImport.tpls;persistTpl();}
     if(pendingImport.settings){S=sanitize(deepMerge(clone(DEFAULTS),pendingImport.settings),pendingImport.settings);saveSettings();applySettings();}
-    rollover();state.smsg='Данные загружены: записей '+items.length+'.';pendingImport=null;
+    rolloverNow();state.smsg='Данные загружены: записей '+items.length+'.';pendingImport=null;
   }
   renderAll();renderSettings();
 }
@@ -2056,14 +2074,15 @@ $('#f-title').addEventListener('input',updateTplHint);
 /* ======= синхронизация: состояние и отслеживание изменений ======= */
 var SYNC_LS='planner.sync.v1';
 var sync=(function(){
-  var d={url:'',key:'',on:false,schSig:'',tests:[],tomb:{},tplTomb:{},sigs:{},tsigs:{},last:0,err:'',nUpd:0,nSig:''};
+  var d={url:'',key:'',on:false,skew:0,schSig:'',tests:[],tomb:{},tplTomb:{},sigs:{},tsigs:{},last:0,err:'',nUpd:0,nSig:''};
   try{var r=store&&store.getItem(SYNC_LS);if(r){var o=JSON.parse(r);if(isObj(o))Object.keys(d).forEach(function(k){if(k in o&&typeof o[k]===typeof d[k])d[k]=o[k];});}}catch(e){}
   return d;
 })();
 function saveSync(){try{store&&store.setItem(SYNC_LS,JSON.stringify(sync));}catch(e){}}
+function syncNow(){return Date.now()+((typeof sync==='object'&&sync&&sync.skew)||0);}
 function rawSig(it){var c={};Object.keys(it).forEach(function(k){if(k!=='upd')c[k]=it[k];});return JSON.stringify(c);}
 function trackList(list,sigs,tomb,skipDemo){
-  var now=Date.now(),seen={},ch=false;
+  var now=syncNow(),seen={},ch=false;
   list.forEach(function(it){
     if(skipDemo&&it.demo)return;
     seen[it.id]=1;
@@ -2078,7 +2097,7 @@ function trackTpls(){if(typeof sync==='object'&&sync&&trackList(tpls,sync.tsigs,
 function noteNotify(){
   if(typeof sync!=='object'||!sync)return;
   var ns=JSON.stringify(S.notify);
-  if(ns!==sync.nSig){sync.nSig=ns;sync.nUpd=Date.now();saveSync();schedSync();}
+  if(ns!==sync.nSig){sync.nSig=ns;sync.nUpd=syncNow();saveSync();schedSync();}
 }
 (function(){ /* первый запуск: пометить уже имеющиеся записи, не меняя их содержимое */
   var ch=trackList(items,sync.sigs,sync.tomb,true);
@@ -2089,9 +2108,11 @@ function noteNotify(){
 })();
 
 /* ======= синхронизация: обмен с сервером ======= */
-var syncTimer=null,syncAgain=false;
+var syncTimer=null,syncAgain=false,syncDirty=false,syncP=null;
+var EXTRA=[]; /* дополнительные списки, синхронизируемые вместе с записями */
 function schedSync(){
   if(!sync.on||!sync.url||!sync.key)return;
+  syncDirty=true;
   clearTimeout(syncTimer);syncTimer=setTimeout(function(){doSync();},1500);
 }
 function fmtClock(ts){var d=new Date(ts);return pad(d.getHours())+':'+pad(d.getMinutes());}
@@ -2126,6 +2147,7 @@ function applyMerged(d){
     try{store&&store.setItem(SET_KEY,JSON.stringify(S));}catch(e){}
     changed=true;
   }
+  EXTRA.forEach(function(x){if(x.apply(d))changed=true;});
   return changed;
 }
 /* ---- обмен через GitHub: файлы в приватном репозитории с данными ---- */
@@ -2135,20 +2157,22 @@ function repoOK(){return /^[\w.-]+\/[\w.-]+$/.test(sync.url);}
 function ghErr(st){
   return st===401?'Токен не подошёл (неверный или истёк)':st===403?'Нет доступа или превышен лимит запросов GitHub':st===404?'Репозиторий не найден или у токена нет к нему доступа':'GitHub ответил: '+st;
 }
+function ghFetch(url,opt){var c=new AbortController(),t=setTimeout(function(){c.abort();},20000);opt=opt||{};opt.signal=c.signal;return fetch(url,opt).finally(function(){clearTimeout(t);});}
 function ghHead(){return {'Authorization':'Bearer '+sync.key,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'};}
 async function ghGet(file){
-  var r=await fetch('https://api.github.com/repos/'+sync.url+'/contents/'+file+'?t='+Date.now(),{headers:ghHead(),cache:'no-store'});
+  var r=await ghFetch('https://api.github.com/repos/'+sync.url+'/contents/'+file+'?t='+Date.now(),{headers:ghHead(),cache:'no-store'});
+  try{var dh=r.headers.get('Date');if(dh){var sv=Date.parse(dh);if(sv)sync.skew=sv-Date.now();}}catch(e){}
   if(r.status===404)return null;
   if(!r.ok){var e=new Error(ghErr(r.status));e.http=r.status;throw e;}
   var j=await r.json(),txt;
   if(j.content&&j.encoding==='base64')txt=b64dec(j.content);
-  else{var r2=await fetch('https://api.github.com/repos/'+sync.url+'/contents/'+file,{headers:Object.assign(ghHead(),{'Accept':'application/vnd.github.raw+json'}),cache:'no-store'});if(!r2.ok)throw new Error(ghErr(r2.status));txt=await r2.text();}
+  else{var r2=await ghFetch('https://api.github.com/repos/'+sync.url+'/contents/'+file,{headers:Object.assign(ghHead(),{'Accept':'application/vnd.github.raw+json'}),cache:'no-store'});if(!r2.ok)throw new Error(ghErr(r2.status));txt=await r2.text();}
   var data=null;try{data=JSON.parse(txt);}catch(e){}
   return {sha:j.sha,data:data};
 }
 async function ghPut(file,obj,sha,msg){
   var body={message:msg||'planner',content:b64enc(JSON.stringify(obj))};if(sha)body.sha=sha;
-  var r=await fetch('https://api.github.com/repos/'+sync.url+'/contents/'+file,{method:'PUT',headers:Object.assign(ghHead(),{'Content-Type':'application/json'}),body:JSON.stringify(body)});
+  var r=await ghFetch('https://api.github.com/repos/'+sync.url+'/contents/'+file,{method:'PUT',headers:Object.assign(ghHead(),{'Content-Type':'application/json'}),body:JSON.stringify(body)});
   if(r.status===409||r.status===422)return 'conflict';
   if(!r.ok){var e=new Error(ghErr(r.status));e.http=r.status;throw e;}
   return 'ok';
@@ -2175,8 +2199,14 @@ function mergeById(server,client,sTomb,cTomb){
   return {map:out,tomb:tomb};
 }
 function cleanSched(a){return (Array.isArray(a)?a:[]).slice(0,500).map(function(e){return {id:String(e.id).slice(0,80),t:Math.round(e.t),title:String(e.title).slice(0,120),body:String(e.body||'').slice(0,200)};});}
-async function doSync(force){
+function doSync(force){
+  if(syncP)return syncP;
+  syncP=doSyncInner(force).then(function(){syncP=null;},function(){syncP=null;});
+  return syncP;
+}
+async function doSyncInner(force){
   if((!sync.on&&!force)||sync.busy)return;
+  syncDirty=false;
   if(!repoOK()){sync.err='Укажите репозиторий в виде «владелец/имя»';saveSync();return;}
   if(sync.key.length<16){sync.err='Токен слишком короткий';saveSync();return;}
   sync.busy=true;var changed=false;
@@ -2188,12 +2218,13 @@ async function doSync(force){
       var b=mergeById(doc.tpls,tpls,doc.tplTomb,sync.tplTomb);
       var notify=doc.notify,nUpd=doc.nUpd||0;
       if(isObj(S.notify)&&(sync.nUpd||0)>nUpd){notify=S.notify;nUpd=sync.nUpd;}
-      var nd={items:a.map,tomb:a.tomb,tpls:b.map,tplTomb:b.tomb,notify:notify,nUpd:nUpd};
+      var nd=Object.assign({},doc,{items:a.map,tomb:a.tomb,tpls:b.map,tplTomb:b.tomb,notify:notify,nUpd:nUpd});
+      EXTRA.forEach(function(x){x.merge(doc,nd);});
       if(JSON.stringify(nd)===JSON.stringify(doc)||(await ghPut('data.json',nd,cur&&cur.sha,'planner sync'))==='ok')merged=nd;
     }
     if(!merged)throw new Error('Конфликт записи, попробуйте ещё раз');
-    changed=applyMerged({items:Object.keys(merged.items).map(function(k){return merged.items[k];}),tomb:merged.tomb,
-      tpls:Object.keys(merged.tpls).map(function(k){return merged.tpls[k];}),tplTomb:merged.tplTomb,notify:merged.notify,nUpd:merged.nUpd});
+    changed=applyMerged(Object.assign({},merged,{items:Object.keys(merged.items).map(function(k){return merged.items[k];}),
+      tpls:Object.keys(merged.tpls).map(function(k){return merged.tpls[k];})}));
     /* расписание уведомлений для отправщика */
     var sch=buildSched(),now=Date.now();
     (sync.tests||[]).forEach(function(t){if(t>now-3600000)sch.push({id:'test-'+t,t:t,title:'Планер',body:'Проверка: уведомления работают'});});
@@ -2205,16 +2236,17 @@ async function doSync(force){
     }
     sync.last=Date.now();sync.err='';
   }catch(e){
-    sync.err=(e&&e.message&&e.message!=='Failed to fetch'&&e.message!=='Load failed')?e.message:'Нет связи с GitHub';
+    sync.err=(e&&e.name!=='AbortError'&&e.message&&e.message!=='Failed to fetch'&&e.message!=='Load failed')?e.message:'Нет связи с GitHub';
   }
   sync.busy=false;saveSync();
   if(changed){renderAll();if(state.view==='tpl')renderTpl();}
   if(state.view==='set')renderSettings();
-  if(changed&&!syncAgain){syncAgain=true;await doSync();syncAgain=false;}
+  if(changed&&!syncAgain){syncAgain=true;await doSyncInner();syncAgain=false;}
+  else if(syncDirty&&sync.on&&!syncAgain)setTimeout(function(){doSync();},300);
 }
-setInterval(function(){if(sync.on&&!document.hidden)doSync();},60000);
+setInterval(function(){if(sync.on&&!document.hidden)doSync();},30000);
 setTimeout(function(){if(sync.on)doSync();},400);
-document.addEventListener('visibilitychange',function(){if(!document.hidden&&sync.on)doSync();});
+document.addEventListener('visibilitychange',function(){if(!sync.on)return;if(!document.hidden)doSync();else if(syncDirty){clearTimeout(syncTimer);doSync();}});
 window.addEventListener('online',function(){if(sync.on)doSync();});
 
 /* ======= расписание уведомлений (его выкладывает любое устройство при синхронизации) ======= */
